@@ -1,32 +1,49 @@
-<?php 
+<?php
 header('Content-Type: application/json; charset=utf-8');
 
 include_once('../../config.php');
 
-// Consulta para obter o cep de origem do projeto
+// [CORRIGIDO] Validação de ambiente com fallback
+$config['melhor_envio_url']   = $_ENV['MELHOR_ENVIO_URL']   ?? getenv('MELHOR_ENVIO_URL')   ?: '';
+$config['melhor_envio_token'] = $_ENV['MELHOR_ENVIO_TOKEN'] ?? getenv('MELHOR_ENVIO_TOKEN') ?: '';
+
+if (empty($config['melhor_envio_url']) || empty($config['melhor_envio_token'])) {
+    http_response_code(500);
+    echo json_encode(['status' => 'erro', 'mensagem' => 'Configuração do Melhor Envio ausente (URL ou token).']);
+    exit;
+}
+
+// Consulta CEP de origem do projeto
 $stmt = $conn->query("SELECT title, cep FROM tb_checkout LIMIT 1");
 $projeto = $stmt->fetch(PDO::FETCH_ASSOC);
 
-$application_name = $projeto['title'];
-$config['cep_origem'] = $projeto['cep'];
-$config['melhor_envio_url'] = $_ENV['MELHOR_ENVIO_URL'];
-$config['melhor_envio_token'] = $_ENV['MELHOR_ENVIO_TOKEN'];
+$application_name = $projeto['title'] ?? 'Loja';
+$config['cep_origem'] = $projeto['cep'] ?? '';
 
 date_default_timezone_set('America/Sao_Paulo');
 
+// [CORRIGIDO] Valida CEP de destino (8 dígitos)
 $cepDestinoRaw = $_POST['cep'] ?? '';
 $cepDestino    = preg_replace('/\D/', '', $cepDestinoRaw);
 
-if (!$cepDestino) {
+if (strlen($cepDestino) !== 8) {
     http_response_code(400);
-    echo json_encode(['status' => 'erro','mensagem' => 'CEP de destino inválido.']);
+    echo json_encode(['status' => 'erro', 'mensagem' => 'CEP de destino inválido.']);
+    exit;
+}
+
+// [CORRIGIDO] Valida CEP de origem
+$cepOrigem = preg_replace('/\D/', '', $config['cep_origem']);
+if (strlen($cepOrigem) !== 8) {
+    http_response_code(500);
+    echo json_encode(['status' => 'erro', 'mensagem' => 'CEP de origem inválido no cadastro do projeto.']);
     exit;
 }
 
 $cart = $_POST['cart'] ?? [];
 if (!is_array($cart) || empty($cart)) {
     http_response_code(400);
-    echo json_encode(['status' => 'erro','mensagem' => 'Carrinho vazio ou formato inválido.']);
+    echo json_encode(['status' => 'erro', 'mensagem' => 'Carrinho vazio ou formato inválido.']);
     exit;
 }
 
@@ -45,7 +62,6 @@ $stmtDim = $conn->prepare("SELECT * FROM tb_frete_dimensoes");
 $stmtDim->execute();
 $dimensoesDb = $stmtDim->fetchAll(PDO::FETCH_ASSOC);
 
-// Indexa por ID
 $dimensoes = [0 => $defaultDimensao];
 foreach ($dimensoesDb as $dim) {
     $dimensoes[(int)$dim['id']] = [
@@ -59,7 +75,7 @@ foreach ($dimensoesDb as $dim) {
 }
 
 $fixedTotal = 0.0;
-$volumes = [];
+$volumes = []; // cada unidade vira um "volume" para consolidar depois
 
 foreach ($cart as $item) {
     $prodId   = intval($item['id'] ?? 0);
@@ -75,27 +91,40 @@ foreach ($cart as $item) {
 
     if (!$produto) continue;
 
-    $type = $produto['freight_type'] ?? 'default';
-    $value = floatval($produto['freight_value'] ?? 0);
+    $type       = $produto['freight_type'] ?? 'default';
+    $value      = floatval($produto['freight_value'] ?? 0);
     $dimensaoId = intval($produto['freight_dimension_id'] ?? 0);
-    $dimensao = $dimensoes[$dimensaoId] ?? $dimensoes[0];
+    $dimensao   = $dimensoes[$dimensaoId] ?? $dimensoes[0];
 
+    // [CORRIGIDO] Frete fixo é somado e o produto NÃO entra no Melhor Envio
     if ($type === 'fixed' && $value > 0) {
         $fixedTotal += $value * $quantity;
         continue;
     }
 
+    // [CORRIGIDO] Garante dimensões/peso válidos (evita 0)
+    $alt  = max(2,   (float)$dimensao['altura']);
+    $lar  = max(11,  (float)$dimensao['largura']);
+    $comp = max(16,  (float)$dimensao['comprimento']);
+    $peso = max(0.3, (float)$dimensao['peso']); // mínimo ME = 0,3 kg
+
     for ($i = 0; $i < $quantity; $i++) {
         $volumes[] = [
-            'height' => $dimensao['altura'],
-            'width' => $dimensao['largura'],
-            'length' => $dimensao['comprimento'],
-            'weight' => $dimensao['peso']
+            'height' => $alt,
+            'width'  => $lar,
+            'length' => $comp,
+            'weight' => $peso
         ];
     }
 }
 
+// [CORRIGIDO] Se só há frete fixo, retorna ele (e não um preço 0)
 if (empty($volumes)) {
+    if ($fixedTotal <= 0) {
+        http_response_code(422);
+        echo json_encode(['status' => 'erro', 'mensagem' => 'Nenhum item válido no carrinho para calcular frete.']);
+        exit;
+    }
     echo json_encode([
         'status'  => 'sucesso',
         'options' => [[
@@ -110,45 +139,46 @@ if (empty($volumes)) {
     exit;
 }
 
-$cepOrigem = preg_replace('/\D/', '', $config['cep_origem']);
+// [CORRIGIDO] Consolida volumes em um único pacote para o endpoint calculate
+$alturaTotal      = 0;
+$larguraMax       = 0;
+$comprimentoMax   = 0;
+$pesoTotal        = 0;
 
+foreach ($volumes as $v) {
+    // Empilha alturas, mantém maior largura e comprimento
+    $alturaTotal    += $v['height'];
+    $larguraMax      = max($larguraMax, $v['width']);
+    $comprimentoMax  = max($comprimentoMax, $v['length']);
+    $pesoTotal      += $v['weight'];
+}
+
+// Limites máximos usuais do ME (evita rejeição)
+$alturaTotal     = min($alturaTotal, 200);
+$larguraMax      = min($larguraMax, 100);
+$comprimentoMax  = min($comprimentoMax, 100);
+
+// [CORRIGIDO] Payload do endpoint CORRETO: /me/shipment/calculate
 $payload = [
-    'service' => [1, 2],
-    "from"    => [
-        "name" => "João",
-        "phone" => "11999999999",
-        "email" => "joao@email.com",
-        "document" => "12345678909",
-        "address" => "Rua A",
-        "number" => "10",
-        "district" => "Centro",
-        "city" => "São Paulo",
-        "state_abbr" => "SP",
-        "country_id" => "BR",
-        "postal_code" => "01001-000"
+    'from' => ['postal_code' => $cepOrigem],
+    'to'   => ['postal_code' => $cepDestino],
+    'package' => [
+        'height' => (int)ceil($alturaTotal),
+        'width'  => (int)ceil($larguraMax),
+        'length' => (int)ceil($comprimentoMax),
+        'weight' => round($pesoTotal, 2)
     ],
-    'to'      => [
-        'name'        => 'Cliente Final',
-        'phone'       => '11999999999',
-        'email'       => 'cliente@email.com',
-        'document'    => '98765432100',
-        'address'     => 'Rua do Cliente',
-        'number'      => '456',
-        'district'    => 'Bairro Legal',
-        'city'        => 'Rio de Janeiro',
-        'state_abbr'  => 'RJ',
-        'country_id'  => 'BR',
-        'postal_code' => $cepDestino
-    ],
-    'volumes' => $volumes,
-    'products' => [], // opcional para o ME, você pode inserir se quiser seguro baseado no valor
     'options' => [
         'insurance_value' => 0,
-        'non_commercial' => true
+        'receipt'         => false,
+        'own_hand'        => false
     ]
 ];
 
-$ch = curl_init($config['melhor_envio_url'] . 'me/cart');
+// [CORRIGIDO] Endpoint correto
+$url = rtrim($config['melhor_envio_url'], '/') . '/me/shipment/calculate';
+
+$ch = curl_init($url);
 curl_setopt_array($ch, [
     CURLOPT_RETURNTRANSFER => true,
     CURLOPT_POST           => true,
@@ -164,29 +194,42 @@ curl_setopt_array($ch, [
 
 $response = curl_exec($ch);
 $err      = curl_error($ch);
+$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 curl_close($ch);
+
+// [CORRIGIDO] Log temporário para diagnóstico (remova depois)
+error_log('ME PAYLOAD: ' . json_encode($payload));
+error_log('ME RESPONSE (HTTP ' . $httpCode . '): ' . $response);
 
 if ($err) {
     http_response_code(500);
-    echo json_encode(['status' => 'erro','mensagem' => 'Comunicação falhou: ' . $err]);
+    echo json_encode(['status' => 'erro', 'mensagem' => 'Comunicação falhou: ' . $err]);
     exit;
 }
 
 $data = json_decode($response, true);
-if (isset($data['message'])) {
+
+// [CORRIGIDO] Valida HTTP e estrutura da resposta
+if ($httpCode >= 400 || !is_array($data)) {
     http_response_code(500);
-    $msg = $data['message'] ?? 'Erro desconhecido na API';
+    $msg = is_array($data) && isset($data['message'])
+        ? $data['message']
+        : 'Falha na API Melhor Envio (HTTP ' . $httpCode . ').';
     echo json_encode(['status' => 'erro', 'mensagem' => $msg]);
     exit;
 }
 
+// [CORRIGIDO] Monta opções; ignora serviços com erro e adiciona o frete fixo
 $options = [];
 foreach ($data as $svc) {
-    $svcPrice = floatval($svc['price'] ?? 0);
+    if (!is_array($svc)) continue;
+    if (!empty($svc['error'])) continue; // serviço indisponível
+
+    $svcPrice   = floatval($svc['price'] ?? 0);
     $totalPrice = $svcPrice + $fixedTotal;
 
     $options[] = [
-        'id'             => $svc['id'] ?? 1,
+        'id'             => $svc['id'] ?? null,
         'name'           => $svc['name'] ?? '',
         'price'          => number_format($totalPrice, 2, '.', ''),
         'delivery_range' => [
@@ -202,6 +245,7 @@ foreach ($data as $svc) {
     ];
 }
 
+// [CORRIGIDO] Se nenhum serviço do ME retornou, mas há frete fixo, devolve só ele
 if (empty($options) && $fixedTotal > 0) {
     $options[] = [
         'id'             => 'fixed_total',
@@ -211,6 +255,12 @@ if (empty($options) && $fixedTotal > 0) {
         'company'        => ['id' => null, 'name' => 'Valor Fixo', 'picture' => null],
         'error'          => null
     ];
+}
+
+if (empty($options)) {
+    http_response_code(422);
+    echo json_encode(['status' => 'erro', 'mensagem' => 'Nenhuma opção de frete disponível para este CEP.']);
+    exit;
 }
 
 echo json_encode([
